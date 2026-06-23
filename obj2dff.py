@@ -217,13 +217,44 @@ def convert(obj_path, dff_path):
 # DFF parser (read back for viewing)
 # ---------------------------------------------------------------------------
 
+SECTION_NAMES = {
+    0x01: "STRUCT", 0x02: "STRING", 0x0E: "FRAMELIST",
+    0x0F: "GEOMETRY", 0x10: "CLUMP", 0x11: "EXTENSION",
+    0x12: "ATOMIC", 0x14: "ATOMIC_OLD", 0x15: "MATERIALLIST",
+    0x16: "TEXTURE", 0x18: "MATERIAL", 0x1A: "GEOMETRYLIST",
+    0x1B: "FRAMELIST_OLD",
+}
+
+
+def _scan_sections(d, off=0, limit=None, depth=0):
+    """Return a list of (sid, size, name, data_offset) found in the data."""
+    if limit is None:
+        limit = len(d)
+    sections = []
+    while off + 12 <= limit:
+        sid, size, ver = struct.unpack('<III', d[off:off + 12])
+        name = SECTION_NAMES.get(sid, f"0x{sid:02X}")
+        data_off = off + 12
+        if data_off + size > limit:
+            break
+        sections.append((sid, size, name, data_off))
+        off = data_off + size
+        if off % 4:
+            off += 4 - (off % 4)
+    return sections
+
+
 def parse_dff(path):
     with open(path, 'rb') as f:
         data = f.read()
 
+    # --- Recursive section walk ---
     def _find_geom(d, off=0):
-        while off + 12 <= len(d):
+        limit = len(d)
+        while off + 12 <= limit:
             sid, size, ver = struct.unpack('<III', d[off:off + 12])
+            if off + 12 + size > limit:
+                break
             chunk = d[off + 12:off + 12 + size]
             if sid == RW_GEOMETRY:
                 return chunk
@@ -238,8 +269,23 @@ def parse_dff(path):
 
     geom = _find_geom(data)
     if geom is None:
-        raise ValueError("No geometry section found in DFF")
+        # --- Fallback: flat scan for any RW_GEOMETRY (0x0F 00 00 00) ---
+        for i in range(len(data) - 12):
+            if data[i:i+4] == b'\x0f\x00\x00\x00':
+                size = struct.unpack('<I', data[i+4:i+8])[0]
+                if i + 12 + size <= len(data):
+                    geom = data[i + 12:i + 12 + size]
+                    break
+    if geom is None:
+        tops = _scan_sections(data)
+        found = ', '.join(s[2] for s in tops) if tops else '(none)'
+        raise ValueError(
+            f"No geometry section found in DFF.\n"
+            f"Top-level sections: {found}\n"
+            f"File size: {len(data)} bytes"
+        )
 
+    # --- Find STRUCT inside geometry ---
     pos = 0
     while pos + 12 <= len(geom):
         sid, size, ver = struct.unpack('<III', geom[pos:pos + 12])
@@ -250,13 +296,19 @@ def parse_dff(path):
         if pos % 4:
             pos += 4 - (pos % 4)
 
-    raise ValueError("No geometry struct found")
+    raise ValueError("No geometry struct found inside geometry section")
 
 
 def _unpack_geom_struct(d):
     p = 0
     flags, nv, nt, num_uv, has_vcol = struct.unpack('<IIIII', d[p:p + 20])
     p += 20
+
+    if flags & 0x100:
+        raise ValueError(
+            f"Native data geometry (flag 0x{flags:04X}) not supported.\n"
+            "This DFF uses a platform-specific format that cannot be read."
+        )
 
     cx, cy, cz, radius = struct.unpack('<4f', d[p:p + 16])
     p += 16
@@ -286,10 +338,18 @@ def _unpack_geom_struct(d):
             p += 8
         uvs.append(layer)
 
+    is_strip = bool(flags & 0x10)
     tris = []
     for _ in range(nt):
-        tris.append(struct.unpack('<HHH', d[p:p + 6]))
+        a, b, c = struct.unpack('<HHH', d[p:p + 6])
         p += 6
+        if not is_strip:
+            tris.append((a, b, c))
+        else:
+            tris.append((a, b, c))
+
+    if not verts:
+        raise ValueError("Geometry has no vertex positions")
 
     return {
         'vertices': verts,
@@ -298,6 +358,7 @@ def _unpack_geom_struct(d):
         'triangles': tris,
         'num_vertices': nv,
         'num_triangles': nt,
+        'flags': flags,
     }
 
 
@@ -340,6 +401,21 @@ def run_viewer(dff_path):
 
     nv = model['num_vertices']
     nt = model['num_triangles']
+
+    # Compute face normals if vertex normals are missing
+    if not norms:
+        norms = [[0.0, 0.0, 0.0] for _ in range(nv)]
+        for t in tris:
+            if t[0] < nv and t[1] < nv and t[2] < nv:
+                v0, v1, v2 = verts[t[0]], verts[t[1]], verts[t[2]]
+                nx = (v1[1] - v0[1]) * (v2[2] - v0[2]) - (v1[2] - v0[2]) * (v2[1] - v0[1])
+                ny = (v1[2] - v0[2]) * (v2[0] - v0[0]) - (v1[0] - v0[0]) * (v2[2] - v0[2])
+                nz = (v1[0] - v0[0]) * (v2[1] - v0[1]) - (v1[1] - v0[1]) * (v2[0] - v0[0])
+                nl = math.sqrt(nx * nx + ny * ny + nz * nz)
+                if nl > 0.001:
+                    norms[t[0]] = [nx / nl, ny / nl, nz / nl]
+                    norms[t[1]] = [nx / nl, ny / nl, nz / nl]
+                    norms[t[2]] = [nx / nl, ny / nl, nz / nl]
 
     try:
         cx = sum(v[0] for v in verts) / nv
@@ -463,21 +539,22 @@ def run_viewer(dff_path):
                             GL.glVertex3fv(verts[b])
                 GL.glEnd()
             else:
-                GL.glDisable(GL.GL_LIGHTING)
-                GL.glColor3f(0.75, 0.75, 0.8)
+                GL.glEnable(GL.GL_LIGHTING)
+                GL.glMaterialfv(GL.GL_FRONT_AND_BACK, GL.GL_AMBIENT_AND_DIFFUSE, [0.75, 0.75, 0.8, 1.0])
+                GL.glMaterialfv(GL.GL_FRONT_AND_BACK, GL.GL_SPECULAR, [0.2, 0.2, 0.2, 1])
+                GL.glMaterialf(GL.GL_FRONT_AND_BACK, GL.GL_SHININESS, 30)
                 GL.glBegin(GL.GL_TRIANGLES)
                 for t in tris:
                     for i in t:
-                        if norms and i < len(norms):
+                        if i < len(norms):
                             GL.glNormal3fv(norms[i])
                         if i < nv:
                             GL.glVertex3fv(verts[i])
                 GL.glEnd()
 
-                GL.glEnable(GL.GL_LIGHTING)
-                GL.glMaterialfv(GL.GL_FRONT_AND_BACK, GL.GL_AMBIENT_AND_DIFFUSE, [0.75, 0.75, 0.8, 1.0])
-
-                GL.glColor3f(0.12, 0.12, 0.14)
+                GL.glDisable(GL.GL_LIGHTING)
+                GL.glDisable(GL.GL_DEPTH_TEST)
+                GL.glColor3f(0.08, 0.08, 0.12)
                 GL.glPolygonMode(GL.GL_FRONT_AND_BACK, GL.GL_LINE)
                 GL.glBegin(GL.GL_TRIANGLES)
                 for t in tris:
@@ -486,6 +563,7 @@ def run_viewer(dff_path):
                             GL.glVertex3fv(verts[i])
                 GL.glEnd()
                 GL.glPolygonMode(GL.GL_FRONT_AND_BACK, GL.GL_FILL)
+                GL.glEnable(GL.GL_DEPTH_TEST)
 
             GL.glPopMatrix()
 
