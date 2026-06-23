@@ -269,13 +269,17 @@ def parse_dff(path):
 
     geom = _find_geom(data)
     if geom is None:
-        # --- Fallback: flat scan for any RW_GEOMETRY (0x0F 00 00 00) ---
+        # --- Fallback: flat scan for valid GEOMETRY sections ---
         for i in range(len(data) - 12):
             if data[i:i+4] == b'\x0f\x00\x00\x00':
                 size = struct.unpack('<I', data[i+4:i+8])[0]
-                if i + 12 + size <= len(data):
-                    geom = data[i + 12:i + 12 + size]
-                    break
+                ver = struct.unpack('<I', data[i+8:i+12])[0]
+                if size > len(data) or i + 12 + size > len(data):
+                    continue
+                if ver < 0x10000 or ver > 0x10000000:
+                    continue
+                geom = data[i + 12:i + 12 + size]
+                break
     if geom is None:
         tops = _scan_sections(data)
         found = ', '.join(s[2] for s in tops) if tops else '(none)'
@@ -289,6 +293,8 @@ def parse_dff(path):
     pos = 0
     while pos + 12 <= len(geom):
         sid, size, ver = struct.unpack('<III', geom[pos:pos + 12])
+        if pos + 12 + size > len(geom):
+            break
         chunk = geom[pos + 12:pos + 12 + size]
         if sid == RW_STRUCT:
             return _unpack_geom_struct(chunk)
@@ -296,7 +302,20 @@ def parse_dff(path):
         if pos % 4:
             pos += 4 - (pos % 4)
 
-    raise ValueError("No geometry struct found inside geometry section")
+    # If STRUCT not found via sections, try reading raw at offset 0
+    if len(geom) >= 20:
+        try:
+            return _unpack_geom_struct(geom)
+        except Exception:
+            pass
+
+    kids = _scan_sections(geom)
+    detail = ', '.join(f"{s[2]}({s[1]}b)" for s in kids) if kids else '(empty)'
+    raise ValueError(
+        f"No geometry struct found inside geometry section.\n"
+        f"Children found: {detail}\n"
+        f"First 32 bytes: {geom[:32].hex()}"
+    )
 
 
 def _unpack_geom_struct(d):
