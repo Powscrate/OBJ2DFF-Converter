@@ -244,48 +244,75 @@ def _scan_sections(d, off=0, limit=None, depth=0):
     return sections
 
 
+def _find_geom_flat(data):
+    """Return geometry section data from the file, or None."""
+    # Walk all sections recursively using the section tree
+    results = []
+    def walk(d, abs_off):
+        off = 0
+        limit = len(d)
+        while off + 12 <= limit:
+            sid, size, ver = struct.unpack('<III', d[off:off + 12])
+            data_off = off + 12
+            if data_off + size > limit:
+                break
+            results.append((sid, size, abs_off + data_off, abs_off + off))
+            if sid in CONTAINER_SECTIONS and size > 0:
+                walk(d[data_off:data_off + size], abs_off + data_off)
+            off = data_off + size
+            if off % 4:
+                off += 4 - (off % 4)
+
+    walk(data, 0)
+
+    # Find first GEOMETRY section
+    for sid, size, abs_data_off, abs_sec_off in results:
+        if sid == RW_GEOMETRY:
+            return data[abs_data_off:abs_data_off + size]
+
+    # Flat byte-level fallback
+    for i in range(len(data) - 12):
+        if data[i:i+4] == b'\x0f\x00\x00\x00':
+            size = struct.unpack('<I', data[i+4:i+8])[0]
+            ver = struct.unpack('<I', data[i+8:i+12])[0]
+            if size < 4 or size > len(data) or i + 12 + size > len(data):
+                continue
+            if ver < 0x10000 or ver > 0x10000000:
+                continue
+            return data[i + 12:i + 12 + size]
+
+    return None
+
+
 def parse_dff(path):
     with open(path, 'rb') as f:
         data = f.read()
 
-    # --- Recursive section walk ---
-    def _find_geom(d, off=0):
-        limit = len(d)
-        while off + 12 <= limit:
-            sid, size, ver = struct.unpack('<III', d[off:off + 12])
-            if off + 12 + size > limit:
-                break
-            chunk = d[off + 12:off + 12 + size]
-            if sid == RW_GEOMETRY:
-                return chunk
-            if sid in CONTAINER_SECTIONS:
-                found = _find_geom(chunk)
-                if found:
-                    return found
-            off += 12 + size
-            if off % 4:
-                off += 4 - (off % 4)
-        return None
-
-    geom = _find_geom(data)
+    geom = _find_geom_flat(data)
     if geom is None:
-        # --- Fallback: flat scan for valid GEOMETRY sections ---
+        raise ValueError(
+            f"No geometry section found in DFF.\n"
+            f"File size: {len(data)} bytes"
+        )
+
+    if geom is None:
+        # --- Flat fallback: scan raw bytes for 0x0F with valid version ---
         for i in range(len(data) - 12):
             if data[i:i+4] == b'\x0f\x00\x00\x00':
                 size = struct.unpack('<I', data[i+4:i+8])[0]
                 ver = struct.unpack('<I', data[i+8:i+12])[0]
-                if size > len(data) or i + 12 + size > len(data):
+                if size < 4 or size > len(data) or i + 12 + size > len(data):
                     continue
                 if ver < 0x10000 or ver > 0x10000000:
                     continue
                 geom = data[i + 12:i + 12 + size]
                 break
+
     if geom is None:
-        tops = _scan_sections(data)
-        found = ', '.join(s[2] for s in tops) if tops else '(none)'
+        found = ', '.join(s[2] for s in set((s[2] for s in all_sections)))
         raise ValueError(
             f"No geometry section found in DFF.\n"
-            f"Top-level sections: {found}\n"
+            f"All sections found: {found}\n"
             f"File size: {len(data)} bytes"
         )
 
